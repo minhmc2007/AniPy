@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-Search, list episodes, play and download from mkissa.to by driving a real browser.
+Search, list, play and download from mkissa.to by driving a real browser.
+
+Anime and manga are the same site with two different tails: a show has a list of
+parts (`episodes` for anime, `chapters` for manga), and a part is either one video
+embed or a run of page images. The shape of that difference lives in `Mode`; the
+browser, the Cloudflare handling and the downloaders are shared.
 
 The site gates its API behind a client computed token, ships source lists
 encrypted in the response body, and sits behind Cloudflare. Its player is a stack
 of third party embeds, and those hosts return 403 unless Referer matches the
-embed page origin.
+embed page origin. Manga pages come off a CDN that answers 403 without a Referer
+too.
 
 So this never speaks the site API. It drives Chromium the way a visitor does and
 reads results from the rendered DOM, then captures whatever the embed player
-assigns to <video> to get a direct file URL.
+assigns to <video> to get a direct file URL, or whatever the reader loaded to get
+a chapter's page images.
 
-Needs playwright and a Chromium build. See README for the mpv extra.
+Needs playwright and a Chromium build. See README for details and NOTE.md for
+the measured facts about the site.
 """
 
 from __future__ import annotations
@@ -19,12 +27,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, asdict
+import zipfile
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -37,6 +47,35 @@ UA = (
     "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 )
 HLS_RE = re.compile(r"\.m3u8(\?|$)", re.I)
+# Reader pages live at /images1<NN>/<id>/<chapter>/<lang>/<n>.<ext>. The path
+# segment varies (images133, images138), the extension varies per page, and
+# covers and avatars are images too, so match the whole path.
+PAGE_RE = re.compile(r"/images\d+/(?:[^/]+/){3}(\d+)\.(jpe?g|png|webp)(?:\?|$)", re.I)
+
+
+@dataclass(frozen=True)
+class Mode:
+    """Everything that differs between the anime and the manga half of the site."""
+
+    name: str       # "anime" | "manga", as in --anime / --manga
+    route: str      # url segment: /anime/<id>, /manga/<id>
+    tab: str        # aria-label prefix of the part list tab
+    part: str       # how a part reads in urls: "p-3-sub" | "chapter-3-sub"
+    word: str       # how a part reads in English
+    short: str      # how a part reads in a listing: "ep" | "ch"
+    part_re: re.Pattern
+
+    def show_path(self, media_id: str) -> str:
+        return f"/{self.route}/{media_id}"
+
+    def search_path(self, query: str) -> str:
+        return f"/search/{self.route}?query={query}"
+
+
+ANIME = Mode("anime", "anime", "Episodes", "p", "episode", "ep",
+             re.compile(r"/p-([0-9.]+)-(sub|dub)\b"))
+MANGA = Mode("manga", "manga", "Chapters", "chapter", "chapter", "ch",
+             re.compile(r"/chapter-([0-9.]+)-(sub|dub)\b"))
 
 
 @dataclass
@@ -60,14 +99,17 @@ class Show:
         if self.score:
             meta.append(f"score {self.score}")
         if self.episodes:
-            meta.append(f"ep {self.episodes}" + (f" ({self.aired})" if self.aired else ""))
+            meta.append(f"parts {self.episodes}"
+                        + (f" ({self.aired})" if self.aired else ""))
         if meta:
             bits.append("[" + ", ".join(meta) + "]")
         return "  ".join(bits)
 
 
 @dataclass
-class Episode:
+class Part:
+    """One episode of an anime, or one chapter of a manga."""
+
     number: str
     label: str
     kind: str  # "sub" | "dub"
@@ -76,6 +118,8 @@ class Episode:
 
 @dataclass
 class Media:
+    """A resolved anime episode: one direct file url plus the host's referer rule."""
+
     url: str
     referer: str
     source: str
@@ -84,6 +128,24 @@ class Media:
     @property
     def is_hls(self) -> bool:
         return self.kind == "hls" or bool(HLS_RE.search(self.url))
+
+
+@dataclass
+class Page:
+    """One page image of a manga chapter."""
+
+    number: int
+    url: str
+    ext: str
+
+
+@dataclass
+class Chapter:
+    """A resolved manga chapter: the reader page, plus its page images in order."""
+
+    url: str
+    referer: str
+    pages: list[Page] = field(default_factory=list)
 
 
 # Captures the url the embed player assigns to <video>, plus the frame it came
@@ -125,6 +187,10 @@ _STEALTH = [
 
 class CloudflareChallenge(RuntimeError):
     pass
+
+
+class NoSuchPart(RuntimeError):
+    """The catalogue does not list the part that was asked for. Retrying is pointless."""
 
 
 class MKissa:
@@ -203,7 +269,7 @@ class MKissa:
         if self.verbose:
             print(*a, file=sys.stderr, flush=True)
 
-    # -- navigation --------------------------------------------------------
+    # navigation
     def _is_challenged(self) -> bool:
         try:
             t = (self.page.title() or "").lower()
@@ -247,53 +313,40 @@ class MKissa:
         except PWError:
             pass
 
-    # -- search ------------------------------------------------------------
-    def search(self, query: str, limit: int = 20) -> list[Show]:
-        self.log(f"[*] searching {query!r}")
-        self.open(BASE + "/", settle=3000)
+    # search
+    def search(self, query: str, mode: Mode, limit: int = 20) -> list[Show]:
+        """Search either catalogue.
 
-        trigger = self.page.query_selector(".header-search__trigger")
-        if trigger:
-            trigger.click()
-            self.page.wait_for_timeout(600)
-        else:
-            self.open(f"{BASE}/search/anime?query={query}", settle=3000)
-            return self._scrape_results(limit)
+        The header search box opens a captcha panel instead of a search box, so
+        this goes straight at the search route, which is not gated.
+        """
+        self.log(f"[*] searching {mode.name} for {query!r}")
+        self.open(BASE + mode.search_path(query), settle=3000)
+        return self._scrape_results(mode, limit)
 
-        box = self.page.wait_for_selector(
-            '[role="dialog"] input[type="search"], [role="dialog"] input',
-            timeout=8000)
-        box.click()
-        box.type(query, delay=70)          # human-ish keystrokes
-        self.page.wait_for_timeout(400)
-        self.page.keyboard.press("Enter")
-        self.page.wait_for_timeout(3500)
-        self._wait_out_challenge()
-        return self._scrape_results(limit)
-
-    def _scrape_results(self, limit: int) -> list[Show]:
+    def _scrape_results(self, mode: Mode, limit: int) -> list[Show]:
         # Scope to .media-card. The page also carries a "Community picks" rail of
-        # /anime/ links that is not search output.
+        # links that is not search output.
         self.page.wait_for_selector(".media-card", timeout=15000)
         self.page.wait_for_timeout(1000)
         raw = self.page.evaluate(
-            """(limit) => {
+            """({route, limit}) => {
               const seen = new Map();
+              const sel = `a[href^='/${route}/']`;
               for (const card of document.querySelectorAll('.media-card')) {
-                const a = card.querySelector("a[href^='/anime/']")
-                       || card.closest('a[href^="/anime/"]');
+                const a = card.querySelector(sel) || card.closest(sel);
                 if (!a) continue;
-                const m = (a.getAttribute('href') || '').match(/^\\/anime\\/([A-Za-z0-9]+)/);
+                const m = (a.getAttribute('href') || '')
+                  .match(new RegExp('^/' + route + '/([A-Za-z0-9]+)'));
                 if (!m || seen.has(m[1])) continue;
-                const t = (sel) => {
-                  const e = card.querySelector(sel);
+                const t = (q) => {
+                  const e = card.querySelector(q);
                   return e ? e.textContent.trim() : null;
                 };
-                const sub = t('.media-card__subtitle') || '';
                 seen.set(m[1], {
                   id: m[1],
                   title: t('.media-card__title'),
-                  subtitle: sub,
+                  subtitle: t('.media-card__subtitle') || '',
                   score: t('.media-card__score-value'),
                   progress: t('.media-card__latest-progress-nums'),
                   kind: t('.media-card__latest-progress-tr'),
@@ -302,77 +355,109 @@ class MKissa:
               }
               return [...seen.values()];
             }""",
-            limit,
+            {"route": mode.route, "limit": limit},
         )
         out = []
         for r in raw:
-            # subtitle looks like "TV · Fall 2024" / "Special · Fall 2024"
-            subtitle = (r.get("subtitle") or "")
-            bits = [x.strip() for x in subtitle.split("·")]
+            # subtitle looks like "TV · Fall 2024" / "Manga · Summer 2004"
+            bits = [x.strip() for x in (r.get("subtitle") or "").split("·")]
             kind = re.sub(r"[()]", "", (r.get("kind") or "")).strip().lower()
             out.append(Show(
                 id=r["id"], title=r["title"] or "",
                 type=bits[0] if bits else None,
                 season=" · ".join(bits[1:]) or None,
                 score=r.get("score"),
-                episodes=re.sub(r"[^\d/]", "", r.get("progress") or "") or None,
+                episodes=re.sub(r"[^\d/.cp ]", "", r.get("progress") or "") or None,
                 aired=kind or None,
-                url=f"{BASE}/anime/{r['id']}",
+                url=BASE + mode.show_path(r["id"]),
             ))
         self.log(f"[*] {len(out)} results")
         return out
 
-    # -- show / episodes ---------------------------------------------------
-    def open_show(self, anime_id: str) -> None:
-        self.open(f"{BASE}/anime/{anime_id}", settle=4000)
-    def episodes(self, anime_id: str) -> list[Episode]:
-        self.open_show(anime_id)
-        tab = self.page.query_selector("button.tab-item[aria-label^='Episodes']")
+    # show / parts
+    def open_show(self, media_id: str, mode: Mode) -> None:
+        self.open(BASE + mode.show_path(media_id), settle=4000)
+
+    def _part_cards(self, media_id: str, mode: Mode) -> list[tuple[str, str]]:
+        """Every (href, label) on the show page's part tab, across all ranges.
+
+        A long list is paginated by chapter number range (`37 – 86`, `1 – 36`)
+        and scrolling does not load the rest, so every range button is visited.
+        """
+        self.open_show(media_id, mode)
+        tab = self.page.query_selector(f"button.tab-item[aria-label^='{mode.tab}']")
         if tab:
             tab.click()
             self.page.wait_for_timeout(2200)
-        cards = self.page.query_selector_all(".media-ep-item")
+
+        read = """() => [...document.querySelectorAll('.media-ep-item[data-href]')]
+            .map(e => [e.getAttribute('data-href'),
+                       (e.innerText || '').replace(/\\s+/g, ' ').trim()])"""
+        cards: dict[str, str] = {}
+        for href, label in self.page.evaluate(read):
+            cards[href] = label
+
+        ranges = self.page.query_selector_all(".media-ep-list__pagination button")
+        for i in range(len(ranges)):
+            self.page.query_selector_all(".media-ep-list__pagination button")[i].click()
+            self.page.wait_for_timeout(2000)
+            for href, label in self.page.evaluate(read):
+                cards.setdefault(href, label)
+
         if not cards:
             raise RuntimeError(
-                f"no episode list for {anime_id} (page: {self.page.url})")
-        eps: list[Episode] = []
-        seen: set[str] = set()
-        for c in cards:
+                f"no {mode.word} list for {media_id} (page: {self.page.url})")
+        return list(cards.items())
+
+    def parts(self, media_id: str, mode: Mode) -> list[Part]:
+        cards = self._part_cards(media_id, mode)
+        out: list[Part] = []
+        seen: set[tuple[str, str]] = set()
+        for href, label in cards:
             # data-href looks like /anime/<id>/p-<number>-<sub|dub>; it is the
             # only field that reliably carries the number (and can be "12.5").
-            href = c.get_attribute("data-href") or ""
-            m = re.search(r"/p-([0-9.]+)-(sub|dub)\b", href)
-            if m:
-                number, kind = m.group(1), m.group(2)
-                url = BASE + href.split("?")[0]
-            else:
-                text = c.inner_text().strip()
-                number = re.sub(r"(?i)^ep\.?\s*", "", text).strip().split("\n")[0]
-                kind = "dub" if c.evaluate(
-                    "e => !!e.closest('[class*=dub], [data-kind=dub]')") else "sub"
-                url = f"{BASE}/anime/{anime_id}/p-{number}-{kind}"
-            if not number or (number, kind) in seen:
+            m = mode.part_re.search(href)
+            if not m:
+                continue
+            number, kind = m.group(1), m.group(2)
+            if (number, kind) in seen:
                 continue
             seen.add((number, kind))
-            eps.append(Episode(number=number, label=c.inner_text().strip().replace("\n", " "),
-                               kind=kind, url=url))
-        self.log(f"[*] {len(eps)} episodes on {anime_id}")
-        return eps
+            out.append(Part(number=number, label=label, kind=kind,
+                            url=BASE + href.split("?")[0]))
+        self.log(f"[*] {len(out)} {mode.word}s on {media_id}")
+        return out
 
-    # -- playback ----------------------------------------------------------
-    def open_episode(self, anime_id: str, number: str, kind: str = "sub",
-                     attempts: int = 6) -> None:
+    def _find_card(self, media_id: str, mode: Mode, number: str,
+                   kind: str) -> Optional[str]:
+        """The href of the requested part, or None if the list does not have it."""
+        for href, _ in self._part_cards(media_id, mode):
+            m = mode.part_re.search(href)
+            if m and m.group(1) == number and m.group(2) == kind:
+                return href
+        return None
+
+    # playback
+    def open_part(self, media_id: str, number: str, kind: str, mode: Mode,
+                  attempts: int = 6) -> None:
         """Walk the normal navigation path, retrying while Cloudflare refuses.
 
-        Each attempt re-walks show page, Episodes tab, episode card instead of
-        reloading one url, and the gaps stay human sized.
+        Each attempt re-walks show page, part tab, part card instead of reloading
+        one url, and the gaps stay human sized. The walk matters: a direct
+        navigation to a part url is a fresh document request and gets the
+        interstitial, while the same page reached by clicking never does.
         """
         last = None
         for i in range(attempts):
             try:
-                self._walk_to_episode(anime_id, number, kind)
-                self.wait_for_sources(timeout_s=45)
+                self._walk_to_part(media_id, number, kind, mode)
+                if mode is ANIME:
+                    self.wait_for_sources(timeout_s=45)
+                else:
+                    self._wait_for_reader(timeout_s=45)
                 return
+            except NoSuchPart:
+                raise
             except (RuntimeError, PWError) as e:
                 last = e
                 if i < attempts - 1:
@@ -380,19 +465,23 @@ class MKissa:
                     self.log(f"  [retry] {i + 1}/{attempts} failed "
                              f"({str(e).splitlines()[0][:60]}); retry in {gap}s")
                     self.page.wait_for_timeout(gap * 1000)
-        raise last if last else RuntimeError("could not open episode")
+        raise last if last else RuntimeError("could not open part")
 
-    def _walk_to_episode(self, anime_id: str, number: str, kind: str) -> None:
-        self.open_show(anime_id)
-        tab = self.page.query_selector("button.tab-item[aria-label^='Episodes']")
-        if tab:
-            tab.click()
-            self.page.wait_for_timeout(1500)
-        card = self.page.query_selector(f'.media-ep-item:has-text("{number}")')
+    def _walk_to_part(self, media_id: str, number: str, kind: str,
+                      mode: Mode) -> None:
+        # Only the click gets in. A direct navigation to a part url is a fresh
+        # document request and Cloudflare holds it, so a part that is not in the
+        # list is reported rather than fetched. Use `episodes` to see what exists.
+        href = self._find_card(media_id, mode, number, kind)
+        if not href:
+            raise NoSuchPart(
+                f"no {mode.short} {number} ({kind}) in the list for {media_id}. "
+                f"Run `episodes {media_id}` to see the {mode.word}s that are there.")
+        card = self.page.query_selector(f'.media-ep-item[data-href="{href}"]')
         if card:
             card.click()
-        else:
-            self.open(f"{BASE}/anime/{anime_id}/p-{number}-{kind}", settle=3000)
+        else:                           # the list moved under us, take the url
+            self.open(BASE + href, settle=3000)
         self.page.wait_for_timeout(2500)
         self._wait_out_challenge()
 
@@ -521,6 +610,148 @@ class MKissa:
                 self.log(f"  [warn] {label} failed: {e}")
         raise RuntimeError("no source resolved. " + " | ".join(errors))
 
+    # manga reader
+    def _wait_for_reader(self, timeout_s: int = 60) -> None:
+        """Wait for the reader to mount its first page slots."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                if self.page.query_selector(".reader-page"):
+                    return
+            except PWError:
+                pass
+            if self._captcha_shown() and self._try_turnstile():
+                pass
+            self.page.wait_for_timeout(2000)
+        raise RuntimeError(
+            f"reader never mounted on {self.page.url}. Try again in a few minutes.")
+
+    # How long to let pending page images land before deciding the scroll is done.
+    _SETTLE_MS = 15_000
+    _SETTLE_POLL_MS = 400
+
+    def _pending_pages(self) -> int:
+        """Page images the reader has in the DOM but has not finished loading.
+
+        A slot is created before its request completes, so this is the honest
+        measure of how far behind the scroll is running.
+        """
+        return self.page.evaluate(
+            """() => [...document.querySelectorAll('.reader-page img')]
+                .filter(i => i.currentSrc && !i.complete).length""")
+
+    def _settle_reader(self) -> None:
+        """Wait until the reader has no page image in flight."""
+        deadline = time.time() + self._SETTLE_MS / 1000
+        while time.time() < deadline:
+            try:
+                if self._pending_pages() == 0:
+                    return
+            except PWError:
+                return
+            self.page.wait_for_timeout(self._SETTLE_POLL_MS)
+
+    def _scroll_reader(self) -> None:
+        """Walk the chapter to its end so every page gets loaded at least once.
+
+        The reader starts a page's request when its slot scrolls into view, so the
+        scroll has to wait for the images in view to land. Stepping without
+        waiting outruns the CDN: the slots go past, the requests never happen, and
+        the chapter comes back with a hole in it. One big jump is worse still, it
+        skips everything in between.
+        """
+        prev, stall = -1, 0
+        while stall < 3:
+            try:
+                self._settle_reader()
+                count = len(self.page.evaluate(
+                    "() => performance.getEntriesByType('resource')"
+                    ".filter(e => /\\/images\\d+\\//.test(e.name))"))
+                at_end = self.page.evaluate(
+                    "() => scrollY + innerHeight >= document.body.scrollHeight - 40")
+            except PWError:
+                return
+            stall = stall + 1 if (count == prev and at_end) else 0
+            prev = count
+            self.page.mouse.wheel(0, 600)
+            self.page.wait_for_timeout(350)
+
+    def _probe_page(self, stem: str, number: int, exts: Iterable[str]) -> Optional[Page]:
+        """Ask the image host whether a page exists. A miss is a small html error."""
+        for ext in exts:
+            url = f"{stem}{number}.{ext}"
+            try:
+                r = self.ctx.request.get(url, headers={"referer": BASE + "/"})
+            except PWError:
+                continue
+            if r.status == 200 and r.headers.get("content-type", "").startswith("image/"):
+                return Page(number=number, url=url, ext=ext)
+        return None
+
+    def pages(self, media_id: str, number: str, kind: str = "sub") -> list[Page]:
+        """Every page image of a chapter, in order.
+
+        The reader recycles its page slots as you scroll, so the live DOM is only
+        a window onto the chapter. The browser's resource timeline keeps what was
+        loaded, and anything the reader never showed is asked for by url.
+        """
+        self.open_part(media_id, number, kind, MANGA)
+        self._scroll_reader()
+
+        urls = self.page.evaluate(
+            "() => performance.getEntriesByType('resource').map(e => e.name)")
+        found: dict[int, Page] = {}
+        for u in urls:
+            m = PAGE_RE.search(u)
+            if m and int(m.group(1)) not in found:
+                found[int(m.group(1))] = Page(number=int(m.group(1)), url=u,
+                                              ext=m.group(2).lower())
+        if not found:
+            raise RuntimeError(f"chapter {number} exposed no page images "
+                               f"(page: {self.page.url})")
+        self.log(f"[*] {len(found)} pages loaded by the reader")
+
+        # The reader may have skipped a page, and the last slot may not be the
+        # last page, so fill the gaps and keep going until the host says no. The
+        # url is a plain path with a trailing slash, so <stem><n>.<ext> is right.
+        last = max(found)
+        stem = re.sub(r"/\d+\.\w+$/", "/", found[last].url)
+        exts = [found[last].ext, "jpg", "png", "webp"]
+        for n in range(1, last + 1):
+            if n in found:
+                continue
+            page = self._probe_page(stem, n, exts)
+            if page:
+                self.log(f"  [gap] page {n} was not in the reader, fetched by url")
+                found[n] = page
+            else:
+                self.log(f"  [warn] page {n} is missing from this chapter")
+        n = last + 1
+        while (page := self._probe_page(stem, n, exts)) is not None:
+            found[n] = page
+            n += 1
+        return [found[k] for k in sorted(found)]
+
+    def chapter(self, media_id: str, number: str, kind: str = "sub") -> Chapter:
+        return Chapter(url=self.page.url, referer=_origin(self.page.url),
+                       pages=self.pages(media_id, number, kind))
+
+    def fetch_page(self, page: Page, referer: str) -> bytes:
+        """Page bytes, through the session that was allowed past Cloudflare.
+
+        The image host answers 403 to a bare request whatever the user agent, and
+        replies with an html error page, so status and content type are both
+        checked before these bytes are treated as an image.
+        """
+        r = self.ctx.request.get(page.url, headers={"referer": referer or BASE + "/"})
+        body = r.body()
+        if r.status != 200 or not r.headers.get("content-type", "").startswith("image/"):
+            raise RuntimeError(
+                f"page {page.number}: host refused the image ({r.status} "
+                f"{r.headers.get('content-type')}). It gates on Referer and that may "
+                f"have changed; re-run to resolve a fresh one.")
+        return body
+
 
 def _origin(url: str) -> str:
     m = re.match(r"^(https?://[^/]+)", url or "")
@@ -593,13 +824,67 @@ def download(media: Media, dest: Path, *, resume: bool = True,
     return dest
 
 
-def play_with_mpv(media: Media, *, extra: Iterable[str] = ()) -> int:
+def download_chapter(session: MKissa, chapter: Chapter, dest: Path, *,
+                     images: bool = False, progress: bool = True) -> Path:
+    """Save a chapter as one .cbz, or with --images as loose numbered pages.
+
+    Stored, not deflated: the pages are already compressed, and readers want the
+    bytes as they came. An .cbz is written in one pass, so it is not resumable;
+    the loose page form skips pages already on disk.
+    """
+    dest = Path(dest).expanduser()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # An .cbz is a zip of the pages as they came, so it is written in one pass and
+    # is not resumable. The loose form writes into a folder and keeps what is
+    # already there, which is how a part finished download is picked up again.
+    zipper = None if images else zipfile.ZipFile(dest, "w", zipfile.ZIP_STORED)
+    if images:
+        dest.mkdir(parents=True, exist_ok=True)
+
+    total_bytes = 0
+    try:
+        for i, page in enumerate(chapter.pages, 1):
+            name = f"page-{page.number:03d}.{page.ext}"
+            if images and (dest / name).exists() and (dest / name).stat().st_size:
+                if progress:
+                    print(f"  {i:>3}/{len(chapter.pages)}  {name}  have it",
+                          file=sys.stderr, flush=True)
+                continue
+            body = session.fetch_page(page, chapter.referer)
+            total_bytes += len(body)
+            if zipper is not None:
+                zipper.writestr(name, body)
+            else:
+                (dest / name).write_bytes(body)
+            if progress:
+                print(f"  {i:>3}/{len(chapter.pages)}  {name}  "
+                      f"{len(body) / 1e6:.2f} MB", file=sys.stderr, flush=True)
+    finally:
+        if zipper is not None:
+            zipper.close()
+    if progress:
+        print(f"[+] {len(chapter.pages)} pages, {total_bytes / 1e6:.1f} MB -> {dest}",
+              file=sys.stderr, flush=True)
+    return dest
+
+
+def open_in_desktop(target: str) -> int:
+    """Hand a url to the desktop's own handler.
+
+    No assumption about which app that is, which is the point: mpv for a stream,
+    a browser for a reader page, a picture viewer for a page image, whatever the
+    user has wired up.
+    """
     import shutil
     import subprocess
-    if not (mpv := shutil.which("mpv")):
-        raise RuntimeError("mpv not found, install it or use `download` instead")
-    cmd = [mpv, "--referrer=" + (media.referer or BASE + "/"),
-           "--user-agent=" + UA, *extra, media.url]
+    if sys.platform == "darwin":
+        cmd = ["open", target]
+    elif os.name == "nt":
+        cmd = ["cmd", "/c", "start", "", target]
+    else:
+        if not (xdg := shutil.which("xdg-open")):
+            raise RuntimeError("xdg-open not found, open the url by hand: " + target)
+        cmd = [xdg, target]
     return subprocess.call(cmd)
 
 
@@ -607,31 +892,64 @@ def _safe(name: str) -> str:
     return re.sub(r"[^\w.\-]+", "_", name).strip("_")[:80] or "video"
 
 
+def _stem(args) -> str:
+    return _safe(args.name or f"{args.media_id}_{args.mode.short}{args.part}")
+
+
 def cmd_search(a: MKissa, args) -> int:
-    for s in a.search(args.query, limit=args.limit):
+    for s in a.search(args.query, args.mode, limit=args.limit):
         print(s)
     return 0
 
 
 def cmd_episodes(a: MKissa, args) -> int:
-    for e in a.episodes(args.anime_id):
-        print(f"{e.kind:3} {e.number:>5}  {e.label}")
+    for p in a.parts(args.media_id, args.mode):
+        print(f"{p.kind:3} {p.number:>5}  {p.label}")
     return 0
 
 
 def cmd_sources(a: MKissa, args) -> int:
-    a.open_episode(args.anime_id, args.episode, args.kind)
+    _need_anime(args)
+    a.open_part(args.media_id, args.part, args.kind, ANIME)
     for s in a.sources():
         print(s)
     return 0
 
 
+def cmd_pages(a: MKissa, args) -> int:
+    _need_manga(args)
+    for p in a.pages(args.media_id, args.part, args.kind):
+        print(f"{p.number:>4}  {p.url}")
+    return 0
+
+
+def _need_anime(args) -> None:
+    if args.mode is not ANIME:
+        raise RuntimeError(f"`{args.cmd}` is anime only. Drop --manga, or use "
+                           f"`--manga url|download|play`.")
+
+
+def _need_manga(args) -> None:
+    if args.mode is not MANGA:
+        raise RuntimeError(f"`{args.cmd}` is manga only. Add --manga.")
+
+
 def _get_media(a: MKissa, args) -> Media:
-    a.open_episode(args.anime_id, args.episode, args.kind)
+    a.open_part(args.media_id, args.part, args.kind, ANIME)
     return a.resolve_best(prefer=args.source, timeout_s=args.timeout)
 
 
 def cmd_url(a: MKissa, args) -> int:
+    if args.mode is MANGA:
+        pages = a.pages(args.media_id, args.part, args.kind)
+        referer = _origin(a.page.url)
+        if args.json:
+            print(json.dumps({"reader": a.page.url, "referer": referer,
+                              "pages": [asdict(p) for p in pages]}, indent=2))
+        else:
+            print(pages[0].url)
+            print(f"# {len(pages)} pages, referer: {referer}", file=sys.stderr)
+        return 0
     m = _get_media(a, args)
     if args.json:
         print(json.dumps(asdict(m), indent=2))
@@ -642,10 +960,18 @@ def cmd_url(a: MKissa, args) -> int:
 
 
 def cmd_download(a: MKissa, args) -> int:
+    if args.mode is MANGA:
+        ch = a.chapter(args.media_id, args.part, args.kind)
+        dest = Path(args.out) if args.out else Path(
+            args.dir) / (_stem(args) if args.images else _stem(args) + ".cbz")
+        print(f"[+] {len(ch.pages)} pages from {ch.url}\n[+] saving to {dest}",
+              file=sys.stderr)
+        download_chapter(a, ch, dest, images=args.images)
+        print(f"[+] done: {dest}", file=sys.stderr)
+        return 0
     m = _get_media(a, args)
     if m.is_hls:
-        stem = args.out or str(Path(args.dir) /
-                               f"{_safe(args.name or args.anime_id + '_ep' + args.episode)}")
+        stem = args.out or str(Path(args.dir) / _stem(args))
         note = Path(stem + ".url")
         note.parent.mkdir(parents=True, exist_ok=True)
         note.write_text(m.url + "\n# referer: " + m.referer + "\n")
@@ -655,8 +981,7 @@ def cmd_download(a: MKissa, args) -> int:
               f"    remux it:  ffmpeg -headers $'Referer: {m.referer}\\r\\n' "
               f"-i '{m.url}' -c copy out.mp4", file=sys.stderr)
         return 2
-    dest = Path(args.out) if args.out else Path(
-        args.dir) / f"{_safe(args.name or args.anime_id + '_ep' + args.episode)}.mp4"
+    dest = Path(args.out) if args.out else Path(args.dir) / f"{_stem(args)}.mp4"
     print(f"[+] source {m.source}\n[+] {m.url}\n[+] saving to {dest}", file=sys.stderr)
     download(m, dest, resume=not args.no_resume)
     print(f"[+] done: {dest}", file=sys.stderr)
@@ -664,8 +989,20 @@ def cmd_download(a: MKissa, args) -> int:
 
 
 def cmd_play(a: MKissa, args) -> int:
-    m = _get_media(a, args)
-    return play_with_mpv(m, extra=args.mpv_args.split() if args.mpv_args else ())
+    if args.mode is MANGA:
+        # The reader page is the chapter: one scrollable document of pictures,
+        # and the desktop opens it with whatever it opens pages with.
+        a.open_part(args.media_id, args.part, args.kind, MANGA)
+        target = a.page.url
+        a.log(f"[*] opening the reader; `--manga url` prints the page image urls")
+    else:
+        m = _get_media(a, args)
+        target = m.url
+        a.log(f"[*] source {m.source}  referer: {m.referer}\n"
+              f"    (that host gates on Referer; a player that cannot set it "
+              f"will show nothing)")
+    print(f"[+] {target}", file=sys.stderr)
+    return open_in_desktop(target)
 
 
 def cmd_clear(args) -> int:
@@ -674,22 +1011,14 @@ def cmd_clear(args) -> int:
     The clearance cookie lands in the profile and gets reused after that.
     """
     profile = args.profile or Path(__file__).parent / ".mkissa-profile"
-    print("A browser window will open on a watch page.", file=sys.stderr)
+    print("A browser window will open on a part page.", file=sys.stderr)
     print("Click the 'Verify you are human' checkbox when it appears.", file=sys.stderr)
     print("The clearance is stored in", profile, file=sys.stderr)
     with MKissa(headless=False, profile=profile, verbose=True) as b:
-        b.open_show(args.anime_id)
-        tab = b.page.query_selector("button.tab-item[aria-label^='Episodes']")
-        if tab:
-            tab.click()
-            b.page.wait_for_timeout(2000)
-        card = b.page.query_selector(".media-ep-item")
-        if card:
-            card.click()
-        else:
-            b.open(f"{BASE}/anime/{args.anime_id}/p-{args.episode}-sub", settle=5000)
+        b.open_part(args.media_id, args.part, args.kind, args.mode)
         try:
-            b.wait_for_sources(timeout_s=args.timeout)
+            b.wait_for_sources(timeout_s=args.timeout) if args.mode is ANIME \
+                else b._wait_for_reader(timeout_s=args.timeout)
         except RuntimeError:
             print("\nNot cleared. Keep the window open, click the checkbox, and "
                   "re-run `clear` if it did not stick.", file=sys.stderr)
@@ -702,58 +1031,74 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mkissa", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--anime", dest="mode", action="store_const", const=ANIME,
+                   help="search and fetch anime (default)")
+    p.add_argument("--manga", dest="mode", action="store_const", const=MANGA,
+                   help="search and fetch manga")
     p.add_argument("--headed", action="store_true",
                    help="show the browser (helps when headless is detected)")
     p.add_argument("--profile", type=Path, help="persistent profile dir")
     p.add_argument("--browser", metavar="PATH",
                    help="browser binary to drive, e.g. /opt/brave-bin/brave")
     p.add_argument("-q", "--quiet", action="store_true")
+    p.set_defaults(mode=ANIME)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("search", help="search the catalogue")
+    s = sub.add_parser("search", help="search the anime or manga catalogue")
     s.add_argument("query")
     s.add_argument("-n", "--limit", type=int, default=20)
     s.set_defaults(fn=cmd_search)
 
-    s = sub.add_parser("episodes", help="list an anime's episodes")
-    s.add_argument("anime_id")
+    s = sub.add_parser("episodes",
+                       help="list an anime's episodes, or a manga's chapters")
+    s.add_argument("media_id")
     s.set_defaults(fn=cmd_episodes)
 
-    s = sub.add_parser("sources", help="list a watchable episode's source tabs")
-    s.add_argument("anime_id")
-    s.add_argument("episode")
+    s = sub.add_parser("sources", help="list a watchable episode's source tabs (anime)")
+    s.add_argument("media_id")
+    s.add_argument("part")
     s.add_argument("--kind", choices=["sub", "dub"], default="sub")
     s.set_defaults(fn=cmd_sources)
 
-    def add_watch_opts(sp):
-        sp.add_argument("anime_id")
-        sp.add_argument("episode")
+    s = sub.add_parser("pages", help="list a chapter's page image urls (manga)")
+    s.add_argument("media_id")
+    s.add_argument("part")
+    s.add_argument("--kind", choices=["sub", "dub"], default="sub")
+    s.set_defaults(fn=cmd_pages)
+
+    def add_part_opts(sp):
+        sp.add_argument("media_id")
+        sp.add_argument("part", help="episode number, or chapter number")
         sp.add_argument("--kind", choices=["sub", "dub"], default="sub")
-        sp.add_argument("--source", help="prefer a source tab (default: auto)")
         sp.add_argument("--timeout", type=int, default=45,
-                        help="seconds to let an embed resolve")
+                        help="seconds to let a part load")
         sp.add_argument("--name", help="filename stem")
 
-    s = sub.add_parser("url", help="print the resolved direct media URL")
-    add_watch_opts(s)
+    s = sub.add_parser("url", help="print the resolved direct media url")
+    add_part_opts(s)
+    s.add_argument("--source", help="prefer a source tab, anime only (default: auto)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_url)
 
-    s = sub.add_parser("download", help="download an episode")
-    add_watch_opts(s)
+    s = sub.add_parser("download", help="download an episode, or a chapter")
+    add_part_opts(s)
+    s.add_argument("--source", help="prefer a source tab, anime only (default: auto)")
     s.add_argument("-o", "--out", help="output file path")
     s.add_argument("-d", "--dir", default=".", help="output directory")
-    s.add_argument("--no-resume", action="store_true")
+    s.add_argument("--no-resume", action="store_true", help="anime only")
+    s.add_argument("--images", action="store_true",
+                   help="manga only: write loose page files instead of one .cbz")
     s.set_defaults(fn=cmd_download)
 
-    s = sub.add_parser("play", help="stream an episode with mpv")
-    add_watch_opts(s)
-    s.add_argument("--mpv-args", default="")
+    s = sub.add_parser("play", help="hand the part to the desktop's own player")
+    add_part_opts(s)
+    s.add_argument("--source", help="prefer a source tab, anime only (default: auto)")
     s.set_defaults(fn=cmd_play)
 
     s = sub.add_parser("clear", help="solve the Cloudflare checkbox by hand")
-    s.add_argument("anime_id")
-    s.add_argument("episode", nargs="?", default="1")
+    s.add_argument("media_id")
+    s.add_argument("part", nargs="?", default="1")
+    s.add_argument("--kind", choices=["sub", "dub"], default="sub")
     s.add_argument("--timeout", type=int, default=300)
     s.set_defaults(fn=cmd_clear)
     return p
